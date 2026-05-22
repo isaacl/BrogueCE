@@ -9,7 +9,7 @@ load, Brogue replays the event stream up to that turn and then switches
 to live play.
 
 Usage examples:
-    # Use most recent recording in default data dir, roll back 5 turns
+    # Use LastRecording.broguerec in default data dir, roll back 5 turns
     python tools/recover_save.py
 
     # Roll back 10 turns from a specific recording
@@ -43,32 +43,17 @@ def find_data_dir() -> str:
         raise RuntimeError("brew --prefix failed; specify --data-dir or --recording")
     if not os.path.isabs(prefix):
         raise RuntimeError(f"brew --prefix returned non-absolute path: {prefix!r}")
-    data_dir: str = os.path.join(prefix, "var", "brogue")
-    if not os.path.isdir(data_dir):
-        raise RuntimeError(f"Brogue data directory not found: {data_dir}")
-    return data_dir
-
-
-def find_most_recent_recording(data_dir: str) -> str:
-    """Find the most recently modified .broguerec file in data_dir."""
-    best: str | None = None
-    best_mtime: float = -1
-    for entry in os.scandir(data_dir):
-        if entry.name.endswith(".broguerec") and entry.is_file():
-            mtime: float = entry.stat().st_mtime
-            if mtime > best_mtime:
-                best = entry.path
-                best_mtime = mtime
-    if not best:
-        raise RuntimeError(f"No .broguerec files found in {data_dir}")
-    return best
+    path = os.path.join(prefix, "var", "brogue")
+    if not os.path.isdir(path):
+        raise RuntimeError(f"Brogue data directory not found: {path}")
+    return path
 
 
 def main(argv: list[str]) -> int | str:
     parser = argparse.ArgumentParser(
         description="Convert a Brogue recording into a save file rolled back N turns.",
         epilog=(
-            "If no recording is specified, the most recent .broguerec in the "
+            "If no recording is specified, LastRecording.broguerec in the "
             "data directory is used. The data directory is found via brew --prefix."
         ),
     )
@@ -92,36 +77,26 @@ def main(argv: list[str]) -> int | str:
         "-v", "--verbose", action="store_true",
         help="Enable verbose logging.",
     )
-    args: Args = parser.parse_args(argv, namespace=Args())
+    args = parser.parse_args(argv, namespace=Args())
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
 
-    # Resolve data directory
-    data_dir: str | None = args.data_dir
-
-    if args.recording:
-        recording_path: str = args.recording
-        if not data_dir:
-            data_dir = os.path.dirname(os.path.abspath(recording_path))
+    # Resolve recording path
+    recording_path = args.recording
+    if not recording_path:
+        out_dir = args.data_dir or find_data_dir()
+        recording_path = os.path.join(out_dir, "LastRecording.broguerec")
     else:
-        if not data_dir:
-            data_dir = find_data_dir()
-        recording_path: str = find_most_recent_recording(data_dir)
-
-    logging.info("Recording: %s", recording_path)
+        out_dir = args.data_dir
 
     # Read the file
     with open(recording_path, "rb") as f:
         data = bytearray(f.read())
 
-    if len(data) < 36:
-        return "File is too small to be a valid Brogue recording."
-
-    original_turns: int = struct.unpack_from(">I", data, 24)[0]
-    logging.info("Original turn count: %d", original_turns)
+    original_turns, = struct.unpack_from(">I", data, 24)
 
     if not original_turns:
         return "Recording has 0 turns; nothing to roll back."
@@ -129,31 +104,32 @@ def main(argv: list[str]) -> int | str:
     if args.turns >= original_turns:
         return f"rollback of {args.turns} turns exceeds game ({original_turns} turns)"
 
-    new_turns: int = original_turns - args.turns
+    new_turns = original_turns - args.turns
 
     struct.pack_into(">I", data, 24, new_turns)
 
     # Determine output path
     if args.output:
-        output_path: str = args.output
+        output_path = args.output
     else:
-        base: str = os.path.splitext(os.path.basename(recording_path))[0]
-        filename: str = f"{base}_recovered_turn{new_turns}.broguesave"
-        if data_dir:
-            output_path = os.path.join(data_dir, filename)
+        base, _ = os.path.splitext(os.path.basename(recording_path))
+        filename = f"{base}_recovered_turn{new_turns}.broguesave"
+        if out_dir:
+            output_path = os.path.join(out_dir, filename)
         else:
-            output_path = filename
+            output_path = os.path.join(os.path.dirname(os.path.abspath(recording_path)), filename)
 
     # Write output; fail if file already exists to avoid accidental overwrites
     try:
         with open(output_path, "xb") as f:
             f.write(data)
-    except FileExistsError:
-        return f"Output file already exists: {output_path}"
+    except FileExistsError as e:
+        e.add_note(f"Output file already exists: {output_path}")
+        raise
 
     logging.debug("Turn count: %d -> %d (rolled back %d)", original_turns, new_turns, args.turns)
-    logging.info("Save written: %s", output_path)
-    return 0
+    if not args.output:
+        logging.info("Save written: %s", output_path)
 
 
 if __name__ == "__main__":
