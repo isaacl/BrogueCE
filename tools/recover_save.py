@@ -20,192 +20,139 @@ Usage examples:
 """
 
 import argparse
+import logging
 import os
-import platform
-import shutil
 import struct
 import subprocess
 import sys
-from pathlib import Path
-
-HEADER_LENGTH = 36
-TURN_OFFSET = 24  # howManyTurns: 4 bytes big-endian at offset 24
-TURN_SIZE = 4
-
-RECORDING_SUFFIX = ".broguerec"
-SAVE_SUFFIX = ".broguesave"
 
 
-def guess_data_dir():
-    """Attempt to find the Brogue data directory."""
-    system = platform.system()
-
-    if system == "Darwin":
-        # Try homebrew prefix
-        try:
-            prefix = subprocess.check_output(
-                ["brew", "--prefix"], text=True, stderr=subprocess.DEVNULL
-            ).strip()
-            candidate = Path(prefix) / "var" / "brogue"
-            if candidate.is_dir():
-                return candidate
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            pass
-        # Common fallback
-        candidate = Path("/opt/homebrew/var/brogue")
-        if candidate.is_dir():
-            return candidate
-        candidate = Path("/usr/local/var/brogue")
-        if candidate.is_dir():
-            return candidate
-    elif system == "Linux":
-        # XDG data home
-        xdg = os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
-        candidate = Path(xdg) / "brogue"
-        if candidate.is_dir():
-            return candidate
-    elif system == "Windows":
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            candidate = Path(appdata) / "brogue"
-            if candidate.is_dir():
-                return candidate
-
-    return None
+def find_data_dir():
+    """Locate the Brogue data directory via brew --prefix."""
+    try:
+        prefix = subprocess.check_output(["brew", "--prefix"], text=True).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        raise RuntimeError("brew --prefix failed; specify --data-dir or --recording")
+    if not os.path.isabs(prefix):
+        raise RuntimeError(f"brew --prefix returned non-absolute path: {prefix!r}")
+    data_dir = os.path.join(prefix, "var", "brogue")
+    if not os.path.isdir(data_dir):
+        raise RuntimeError(f"Brogue data directory not found: {data_dir}")
+    return data_dir
 
 
 def find_most_recent_recording(data_dir):
     """Find the most recently modified .broguerec file in data_dir."""
-    recordings = list(Path(data_dir).glob(f"*{RECORDING_SUFFIX}"))
-    if not recordings:
-        return None
-    return max(recordings, key=lambda p: p.stat().st_mtime)
+    best = None
+    best_mtime = -1
+    for entry in os.scandir(data_dir):
+        if entry.name.endswith(".broguerec") and entry.is_file():
+            mtime = entry.stat().st_mtime
+            if mtime > best_mtime:
+                best = entry.path
+                best_mtime = mtime
+    if not best:
+        raise RuntimeError(f"No .broguerec files found in {data_dir}")
+    return best
 
 
-def read_turn_count(data):
-    """Read the turn counter from the recording header."""
-    return struct.unpack_from(">I", data, TURN_OFFSET)[0]
-
-
-def write_turn_count(data, turns):
-    """Write a new turn counter into the header."""
-    struct.pack_into(">I", data, TURN_OFFSET, turns)
-
-
-def main():
+def main(argv):
     parser = argparse.ArgumentParser(
         description="Convert a Brogue recording into a save file rolled back N turns.",
         epilog=(
             "If no recording is specified, the most recent .broguerec in the "
-            "data directory is used. On macOS/Homebrew the data directory "
-            "defaults to $(brew --prefix)/var/brogue."
+            "data directory is used. The data directory is found via brew --prefix."
         ),
     )
     parser.add_argument(
-        "-t", "--turns",
-        type=int,
-        default=5,
+        "-t", "--turns", type=int, default=5,
         help="Number of turns to roll back (default: 5).",
     )
     parser.add_argument(
         "-r", "--recording",
-        type=str,
-        default=None,
         help="Path to the .broguerec file to convert.",
     )
     parser.add_argument(
         "-d", "--data-dir",
-        type=str,
-        default=None,
         help="Brogue data/saves directory.",
     )
     parser.add_argument(
         "-o", "--output",
-        type=str,
-        default=None,
         help="Output path for the .broguesave file.",
     )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable verbose logging.",
+    )
+    args = parser.parse_args(argv)
 
-    args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
 
     # Resolve data directory
-    data_dir = Path(args.data_dir) if args.data_dir else None
+    data_dir = args.data_dir
 
-    # If recording is given, check if its parent looks like the data dir
     if args.recording:
-        recording_path = Path(args.recording)
-        if not recording_path.exists():
-            sys.exit(f"Error: recording not found: {recording_path}")
-        if data_dir is None:
-            # Check if the recording lives in a plausible data dir
-            parent = recording_path.parent
-            if list(parent.glob(f"*{RECORDING_SUFFIX}")):
-                data_dir = parent
+        recording_path = args.recording
+        if not data_dir:
+            data_dir = os.path.dirname(os.path.abspath(recording_path))
     else:
-        # No recording specified; need data dir to find one
-        if data_dir is None:
-            data_dir = guess_data_dir()
-        if data_dir is None:
-            sys.exit(
-                "Error: could not determine data directory. "
-                "Specify --data-dir or --recording."
-            )
-        if not data_dir.is_dir():
-            sys.exit(f"Error: data directory does not exist: {data_dir}")
-
+        if not data_dir:
+            data_dir = find_data_dir()
         recording_path = find_most_recent_recording(data_dir)
-        if recording_path is None:
-            sys.exit(f"Error: no {RECORDING_SUFFIX} files found in {data_dir}")
 
-    print(f"Recording: {recording_path}")
+    logging.info("Recording: %s", recording_path)
 
     # Read the file
-    data = bytearray(recording_path.read_bytes())
+    with open(recording_path, "rb") as f:
+        data = bytearray(f.read())
 
-    if len(data) < HEADER_LENGTH:
-        sys.exit("Error: file is too small to be a valid Brogue recording.")
+    if len(data) < 36:
+        return "File is too small to be a valid Brogue recording."
 
-    original_turns = read_turn_count(data)
-    print(f"Original turn count: {original_turns}")
+    original_turns = struct.unpack_from(">I", data, 24)[0]
+    logging.info("Original turn count: %d", original_turns)
 
     if original_turns == 0:
-        sys.exit("Error: recording has 0 turns; nothing to roll back.")
+        return "Recording has 0 turns; nothing to roll back."
 
-    rollback = args.turns
-    if rollback >= original_turns:
-        # Roll back to turn 1 at minimum
-        rollback = original_turns - 1
-        print(f"Warning: requested rollback exceeds turn count; rolling back to turn 1.")
+    if args.turns >= original_turns:
+        return (
+            f"Cannot roll back {args.turns} turns: recording only has "
+            f"{original_turns} turns."
+        )
 
-    new_turns = original_turns - rollback
-    if new_turns < 1:
-        new_turns = 1
+    new_turns = original_turns - args.turns
+    logging.info("New turn count: %d (rolled back %d turns)", new_turns, args.turns)
 
-    print(f"New turn count: {new_turns} (rolled back {original_turns - new_turns} turns)")
-
-    write_turn_count(data, new_turns)
+    struct.pack_into(">I", data, 24, new_turns)
 
     # Determine output path
     if args.output:
-        output_path = Path(args.output)
+        output_path = args.output
     else:
-        # Build a descriptive filename
-        stem = recording_path.stem
-        suffix = f"_recovered_turn{new_turns}{SAVE_SUFFIX}"
-        filename = stem + suffix
-
+        base = os.path.splitext(os.path.basename(recording_path))[0]
+        filename = f"{base}_recovered_turn{new_turns}.broguesave"
         if data_dir:
-            output_path = data_dir / filename
+            output_path = os.path.join(data_dir, filename)
         else:
-            output_path = Path.cwd() / filename
+            output_path = filename
 
-    # Don't overwrite the original
-    if output_path.resolve() == recording_path.resolve():
-        sys.exit("Error: output path is the same as input. Specify a different --output.")
+    if os.path.abspath(output_path) == os.path.abspath(recording_path):
+        return "Output path is the same as input. Specify a different --output."
 
-    output_path.write_bytes(data)
-    print(f"Save written: {output_path}")
+    # Write output; fail if file already exists to avoid accidental overwrites
+    try:
+        with open(output_path, "xb") as f:
+            f.write(data)
+    except FileExistsError:
+        return f"Output file already exists: {output_path}"
+
+    logging.info("Save written: %s", output_path)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main(sys.argv[1:]))
